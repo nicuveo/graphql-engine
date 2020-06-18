@@ -18,6 +18,7 @@ import           Data.Int                      (Int32)
 import           Data.Parser.JSONPath
 import           Data.Type.Equality
 import           Language.GraphQL.Draft.Syntax hiding (Definition)
+import           Data.Scientific                        (toBoundedInteger, toRealFloat)
 
 import           Hasura.GraphQL.Parser.Class
 import           Hasura.GraphQL.Parser.Collect
@@ -230,7 +231,7 @@ scalar
   -> Parser 'Both m a
 scalar name description representation = Parser
   { pType = NonNullable $ TNamed $ mkDefinition name description TIScalar
-  , pParser = peelVariable >=> \v -> case representation of
+  , pParser = peelVariable ExpectString >=> \v -> case representation of
       SRBoolean -> case v of
         VBoolean a -> pure a
         _          -> typeMismatch name "a boolean" v
@@ -272,7 +273,7 @@ enum
   -> Parser 'Both m a
 enum name description values = Parser
   { pType = NonNullable $ TNamed $ mkDefinition name description $ TIEnum (fst <$> values)
-  , pParser = peelVariable >=> \case
+  , pParser = peelVariable ExpectEnum >=> \case
       VEnum (EnumValue value) -> case M.lookup value valuesMap of
         Just result -> pure result
         Nothing -> parseError $ "expected one of the values "
@@ -288,7 +289,7 @@ nullable parser = gcastWith (inputParserInput @k) Parser
   { pType = case pType parser of
       NonNullable t -> Nullable t
       Nullable t    -> Nullable t
-  , pParser = peelVariable >=> \case
+  , pParser = peelVariable ExpectString >=> \case
       VNull -> pure Nothing
       other -> Just <$> pParser parser other
   }
@@ -332,7 +333,7 @@ nonNullableParser parser = parser { pType = nonNullableType (pType parser) }
 list :: forall k m a. (MonadParse m, 'Input <: k) => Parser k m a -> Parser k m [a]
 list parser = gcastWith (inputParserInput @k) Parser
   { pType = NonNullable $ TList $ pType parser
-  , pParser = peelVariable >=> \case
+  , pParser = peelVariable ExpectString >=> \case
       VList values -> for (zip [0..] values) \(index, value) ->
         withPath (Index index :) $ pParser parser value
       -- List Input Coercion
@@ -359,7 +360,7 @@ object
 object name description parser = Parser
   { pType = NonNullable $ TNamed $ mkDefinition name description $
       TIInputObject (ifDefinitions parser)
-  , pParser = peelVariable >=> \case
+  , pParser = peelVariable ExpectString >=> \case
       VObject fields -> do
         -- check for extraneous fields here, since the InputFieldsParser just
         -- handles parsing the fields it cares about
@@ -401,48 +402,50 @@ fieldWithDefault name description defaultValue parser = InputFieldsParser
   { ifDefinitions = [mkDefinition name description $
       IFOptional (discardNullability $ pType parser) (Just defaultValue)]
   , ifParser = M.lookup name >>> withPath (Key (unName name) :) . \case
-      Just value -> parseValue value
+      Just value -> pInputParser parser value
       Nothing    -> pInputParser parser $ literal defaultValue
   }
   where
-    parseValue = \value -> case value of
-      VVariable (Variable { vInfo, vValue }) ->
-        -- This case is tricky: if we get a nullable variable, we have to
-        -- pessimistically mark the query non-reusable, regardless of its
-        -- contents. Why? Well, suppose we have a type like
-        --
-        --     type Foo {
-        --       bar(arg: Int = 42): String
-        --     }
-        --
-        -- and suppose we receive the following query:
-        --
-        --     query blah($var: Int) {
-        --       foo {
-        --         bar(arg: $var)
-        --       }
-        --     }
-        --
-        -- Suppose no value is provided for $var, so it defaults to null. When
-        -- we parse the arg field, we see it has a default value, so we
-        -- substitute 42 for null and carry on. But now we’ve discarded the
-        -- information that this value came from a variable at all, so if we
-        -- cache the query plan, changes to the variable will be ignored, since
-        -- we’ll always use 42!
-        --
-        -- Note that the problem doesn’t go away even if $var has a non-null
-        -- value. In that case, we’d simply have flipped the problem around: now
-        -- our cached query plan will do the wrong thing if $var *is* null,
-        -- since we won’t know to substitute 42.
-        --
-        -- Theoretically, we could be smarter here: we could record a sort of
-        -- “derived variable reference” that includes a new default value. But
-        -- that would be more complicated, so for now we don’t do that.
-        case vInfo of
-          VIRequired _   -> parseValue value
-          VIOptional _ _ -> markNotReusable *> parseValue (literal vValue)
-      VNull -> pInputParser parser $ literal defaultValue
-      other -> pInputParser parser other
+    -- FIXME: I believe this to be obsolete?
+    -- parseValue = \value -> case value of
+    --   VVariable (Variable { vInfo, vValue }) ->
+    --     -- This case is tricky: if we get a nullable variable, we have to
+    --     -- pessimistically mark the query non-reusable, regardless of its
+    --     -- contents. Why? Well, suppose we have a type like
+    --     --
+    --     --     type Foo {
+    --     --       bar(arg: Int = 42): String
+    --     --     }
+    --     --
+    --     -- and suppose we receive the following query:
+    --     --
+    --     --     query blah($var: Int) {
+    --     --       foo {
+    --     --         bar(arg: $var)
+    --     --       }
+    --     --     }
+    --     --
+    --     -- Suppose no value is provided for $var, so it defaults to null. When
+    --     -- we parse the arg field, we see it has a default value, so we
+    --     -- substitute 42 for null and carry on. But now we’ve discarded the
+    --     -- information that this value came from a variable at all, so if we
+    --     -- cache the query plan, changes to the variable will be ignored, since
+    --     -- we’ll always use 42!
+    --     --
+    --     -- Note that the problem doesn’t go away even if $var has a non-null
+    --     -- value. In that case, we’d simply have flipped the problem around: now
+    --     -- our cached query plan will do the wrong thing if $var *is* null,
+    --     -- since we won’t know to substitute 42.
+    --     --
+    --     -- Theoretically, we could be smarter here: we could record a sort of
+    --     -- “derived variable reference” that includes a new default value. But
+    --     -- that would be more complicated, so for now we don’t do that.
+    --     case vInfo of
+    --       VIRequired _   -> parseValue value
+    --       VIOptional _ _ -> peelVariable
+    --         markNotReusable *> parseValue (literal vValue)
+    --   VNull -> pInputParser parser $ literal defaultValue
+    --   other -> pInputParser parser other
 
 -- | A nullable field with no default value. If the field is omitted, the
 -- provided parser /will not be called/. This allows a field to distinguish an
@@ -604,7 +607,7 @@ subselection_ name description bodyParser =
 -- helpers
 
 graphQLToJSON :: MonadParse m => Value Variable -> m A.Value
-graphQLToJSON = peelVariable >=> \case
+graphQLToJSON = peelVariable ExpectString >=> \case
   VNull               -> pure A.Null
   VInt i              -> pure $ A.toJSON i
   VFloat f            -> pure $ A.toJSON f
@@ -616,16 +619,46 @@ graphQLToJSON = peelVariable >=> \case
   -- this should not be possible, as we peel any variable first
   VVariable _         -> error "FIMXE: this should be a 500 with a descriptive message"
 
-peelVariable :: MonadParse m => Value Variable -> m (Value Variable)
-peelVariable (VVariable (Variable { vValue })) = markNotReusable $> literal vValue
-peelVariable value                             = pure value
+data JSONDecodingOption = ExpectString
+                        | ExpectEnum
+
+jsonToGraphQL :: MonadParse m => JSONDecodingOption -> VariableInfo -> A.Value -> m (Value Variable)
+jsonToGraphQL option vInfo = \case
+  A.Null          -> pure $ VNull
+  (A.Bool   val)  -> pure $ VBoolean val
+  (A.String val)  -> case option of
+    ExpectString -> pure $ VString val
+    ExpectEnum   -> case mkName val of
+      Nothing   -> parseError $
+        "variable value contains object with enum value " <> val
+        <<> ", which is not a legal GraphQL name"
+      Just name -> pure $ VEnum $ EnumValue name
+  (A.Number val)
+    | Just intVal <- toBoundedInteger val -> pure $ VInt intVal
+    | floatVal <- toRealFloat val         -> pure $ VFloat floatVal
+  (A.Array  vals) -> pure $ VList [ VVariable $ Variable vInfo $ JSONValue val | val <- toList vals]
+  (A.Object vals) ->  VObject . M.fromList <$> for (M.toList vals) \(key, val) -> do
+    name <- mkName key `onNothing` parseError
+      ("variable value contains object with key " <> key
+       <<> ", which is not a legal GraphQL name")
+    pure (name, VVariable $ Variable vInfo $ JSONValue val)
+
+peelVariable :: MonadParse m => JSONDecodingOption -> Value Variable -> m (Value Variable)
+peelVariable option = \case
+  VVariable (Variable { vInfo, vValue }) -> do
+    markNotReusable
+    case vValue of
+      GraphQLValue gValue -> pure $ literal gValue
+      JSONValue    jValue -> jsonToGraphQL option vInfo jValue
+  value -> pure value
 
 typeMismatch :: MonadParse m => Name -> Text -> Value Variable -> m a
 typeMismatch name expected given = parseError $
   "expected " <> expected <> " for type " <> name <<> ", but found " <> describeValue given
 
 describeValue :: Value Variable -> Text
-describeValue = describeValueWith (describeValueWith absurd . vValue)
+describeValue = describeValueWith describeVariable
+  where describeVariable = error "FIXME: we should never attempt to describe a variable"
 
 describeValueWith :: (var -> Text) -> Value var -> Text
 describeValueWith describeVariable = \case
